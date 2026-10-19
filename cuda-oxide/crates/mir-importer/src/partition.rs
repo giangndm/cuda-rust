@@ -40,6 +40,20 @@
 //!
 //! Every group gets its own module disambiguator, so counter-named
 //! module-scope symbols (`__shared_mem_*`) stay unique in the merged module.
+//!
+//! The key must not depend on which cargo target of a crate is compiled. A
+//! `cfg(test)` lib-test build or a build with another cargo feature has the
+//! same crate name but a different stable crate id (rustc hashes `-C
+//! metadata` into it), and that id leaks into the key twice: through the
+//! group disambiguator and through the v0 mangled names of generic
+//! instantiations and local items (`..C` `s<base62 id>_` `<len><crate name>`).
+//! Both are therefore derived from the crate name only: the disambiguator is
+//! `sha256(crate name, group)`, and the crate's own id fragment is replaced by
+//! a fixed token while hashing (see [`CrateIdentity`]). The PTX keeps only the
+//! mangled names in debug strings, kernel entries are explicit, and PTX of
+//! different targets of one crate is never merged into one module (one binary
+//! embeds one target's device code), so the name-derived disambiguator keeps
+//! `__shared_mem_*` unique between the crates that do share a module.
 //! A Rust `static` reached from two groups would be duplicated, so that case
 //! is reported as unsupported and the caller falls back to the monolithic
 //! pipeline.
@@ -205,8 +219,12 @@ pub fn run_partitioned_pipeline(
     }
     crate::translator::facts::set_known_defs(known_defs);
     std::fs::create_dir_all(&config.output_dir).map_err(export_error)?;
-    let crate_disambiguator = config.module_disambiguator.unwrap_or(0);
-    let work_dir = partition_work_dir(&config.output_dir, &config.output_name, crate_disambiguator);
+    // The real crate id only isolates scratch files between the cargo targets
+    // of one crate; keys and PTX symbol names use the target-independent id.
+    let crate_id = config.module_disambiguator.unwrap_or(0);
+    let work_dir = partition_work_dir(&config.output_dir, &config.output_name, crate_id);
+    let crate_identity = CrateIdentity::new(&config.output_name, crate_id);
+    let crate_disambiguator = crate_identity.disambiguator();
     std::fs::create_dir_all(&work_dir).map_err(export_error)?;
 
     let base_backend = backend_options_for(config);
@@ -241,14 +259,11 @@ pub fn run_partitioned_pipeline(
                     let Ok(job) = next else { break };
                     let index = job.index;
                     let mut backend = base_backend.clone();
-                    // A single group is the monolithic module: it keeps the
-                    // crate's disambiguator, so its PTX is byte-identical.
-                    if partitions.len() > 1 {
-                        backend.module_disambiguator = Some(group_disambiguator(
-                            crate_disambiguator,
-                            &partitions[index].name,
-                        ));
-                    }
+                    backend.module_disambiguator = Some(if partitions.len() > 1 {
+                        group_disambiguator(crate_disambiguator, &partitions[index].name)
+                    } else {
+                        crate_disambiguator
+                    });
                     let result = compile_group(
                         job,
                         &backend,
@@ -294,6 +309,7 @@ pub fn run_partitioned_pipeline(
                 &ctx,
                 module_op,
                 &options_fingerprint,
+                &crate_identity,
                 if partitions.len() > 1 {
                     group_disambiguator(crate_disambiguator, &partition.name)
                 } else {
@@ -540,13 +556,114 @@ fn compile_group(
     Ok(group)
 }
 
+/// A crate as seen by the cache key: its name and its stable crate id.
+///
+/// The id differs between the cargo targets of one crate (lib, lib-test,
+/// feature sets) although the device code is identical, so the key replaces
+/// the id wherever rustc's v0 mangling embeds it and derives the module
+/// disambiguator from the name alone (see the module docs).
+struct CrateIdentity {
+    name: String,
+    /// `C` `s<base62(id)>_` `<len><name>` as v0 mangling spells this crate.
+    needle: Vec<u8>,
+    /// The same path with a fixed id fragment.
+    replacement: Vec<u8>,
+}
+
+impl CrateIdentity {
+    fn new(name: &str, stable_crate_id: u64) -> Self {
+        let tail = format!("{}{name}", name.len());
+        // v0 `push_disambiguator`: nothing for 0, else `s` + integer_62(id - 1),
+        // where integer_62(0) is `_` and integer_62(n) is base62(n - 1) + `_`.
+        let needle = match stable_crate_id.checked_sub(1) {
+            None => format!("C{tail}"),
+            Some(id) => format!("Cs{}_{tail}", base62_integer(id)),
+        };
+        Self {
+            name: name.to_string(),
+            needle: needle.into_bytes(),
+            replacement: format!("Cs_{tail}").into_bytes(),
+        }
+    }
+
+    /// Module disambiguator shared by every target of this crate.
+    fn disambiguator(&self) -> u64 {
+        let digest = Sha256::new()
+            .chain_update(b"crate-name:")
+            .chain_update(self.name.as_bytes())
+            .finalize();
+        u64::from_le_bytes(digest[..8].try_into().expect("sha256 has 32 bytes"))
+    }
+}
+
+/// rustc's `push_integer_62` body for `n`: `_` for 0, else base62(n - 1) + `_`.
+fn base62_integer(n: u64) -> String {
+    const DIGITS: &[u8; 62] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let Some(mut rest) = n.checked_sub(1) else {
+        return String::new();
+    };
+    let mut digits = Vec::new();
+    loop {
+        digits.push(DIGITS[(rest % 62) as usize]);
+        rest /= 62;
+        if rest == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("base62 digits are ASCII")
+}
+
 /// `fmt::Write` sink that feeds a hasher, so the printed module is never
-/// materialized as one string.
-struct HashWriter<'a>(&'a mut Sha256);
+/// materialized as one string. It rewrites every occurrence of the crate's
+/// own mangled-path prefix (which may straddle two chunks) to its fixed form.
+struct HashWriter<'a> {
+    hasher: &'a mut Sha256,
+    identity: &'a CrateIdentity,
+    /// Bytes that may still start a match.
+    carry: Vec<u8>,
+}
+
+impl<'a> HashWriter<'a> {
+    fn new(hasher: &'a mut Sha256, identity: &'a CrateIdentity) -> Self {
+        Self {
+            hasher,
+            identity,
+            carry: Vec::new(),
+        }
+    }
+
+    /// Hash every byte not held back; `last` flushes the held-back tail.
+    fn drain(&mut self, last: bool) {
+        let needle = &self.identity.needle;
+        let mut data = std::mem::take(&mut self.carry);
+        let mut start = 0;
+        while let Some(at) = find(&data[start..], needle) {
+            self.hasher.update(&data[start..start + at]);
+            self.hasher.update(&self.identity.replacement);
+            start += at + needle.len();
+        }
+        let keep_from = if last {
+            data.len()
+        } else {
+            // A match can begin only within the last `needle.len() - 1` bytes.
+            start.max(data.len().saturating_sub(needle.len() - 1))
+        };
+        self.hasher.update(&data[start..keep_from]);
+        self.carry = data.split_off(keep_from);
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
 
 impl std::fmt::Write for HashWriter<'_> {
     fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        self.0.update(text.as_bytes());
+        self.carry.extend_from_slice(text.as_bytes());
+        self.drain(false);
         Ok(())
     }
 }
@@ -555,14 +672,16 @@ fn group_key(
     ctx: &Context,
     module: Ptr<Operation>,
     options_fingerprint: &str,
+    identity: &CrateIdentity,
     disambiguator: u64,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(CACHE_FORMAT.as_bytes());
     hasher.update(options_fingerprint.as_bytes());
     hasher.update(disambiguator.to_le_bytes());
-    write!(HashWriter(&mut hasher), "{}", module.deref(ctx).disp(ctx))
-        .expect("hashing never fails");
+    let mut writer = HashWriter::new(&mut hasher, identity);
+    write!(writer, "{}", module.deref(ctx).disp(ctx)).expect("hashing never fails");
+    writer.drain(true);
     hex(&hasher.finalize())
 }
 
@@ -1233,7 +1352,7 @@ mod tests {
         groups.map(|functions| {
             let mut ctx = Context::new();
             let module = module_with(&mut ctx, functions);
-            group_key(&ctx, module, "options", 7)
+            group_key(&ctx, module, "options", &CrateIdentity::new("probe", 5), 7)
         })
     }
 
@@ -1268,10 +1387,94 @@ mod tests {
         let key = |options: &str, disambiguator: u64| {
             let mut ctx = Context::new();
             let module = module_with(&mut ctx, &[("kernel", &[])]);
-            group_key(&ctx, module, options, disambiguator)
+            group_key(
+                &ctx,
+                module,
+                options,
+                &CrateIdentity::new("probe", 5),
+                disambiguator,
+            )
         };
         assert_ne!(key("sm_120a", 1), key("sm_90", 1));
         assert_ne!(key("sm_120a", 1), key("sm_120a", 2));
+    }
+
+    /// Key of a module whose one function is named `symbol`.
+    fn symbol_key(symbol: &str, identity: &CrateIdentity) -> String {
+        let mut ctx = Context::new();
+        let module = module_with(&mut ctx, &[(symbol, &[])]);
+        group_key(&ctx, module, "options", identity, 7)
+    }
+
+    #[test]
+    fn crate_id_fragment_matches_rustc_v0_mangling() {
+        // `_RINvNtNtCs..._11cuda_device6thread10___internal8index_1d..ECsanYTrAQPVh4_5probe`
+        // was emitted by rustc for the crate `probe` whose stable id is below.
+        let id = crate_id_of_token("anYTrAQPVh4");
+        assert_eq!(base62_integer(id - 1), "anYTrAQPVh4");
+        let identity = CrateIdentity::new("probe", id);
+        assert_eq!(identity.needle, b"CsanYTrAQPVh4_5probe");
+        assert_eq!(identity.replacement, b"Cs_5probe");
+        assert_eq!(CrateIdentity::new("probe", 0).needle, b"C5probe");
+        assert_eq!(CrateIdentity::new("probe", 1).needle, b"Cs_5probe");
+        assert_eq!(CrateIdentity::new("probe", 2).needle, b"Cs0_5probe");
+    }
+
+    /// Stable crate id whose v0 token is `token` (inverse of `base62_integer(id - 1)`).
+    fn crate_id_of_token(token: &str) -> u64 {
+        const DIGITS: &str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        token
+            .chars()
+            .fold(0u64, |n, c| n * 62 + DIGITS.find(c).unwrap() as u64)
+            + 2
+    }
+
+    #[test]
+    fn group_key_ignores_the_crate_id_of_every_target() {
+        let symbol =
+            |token: &str| format!("_RINvNtCs1_11cuda_device6thread8index_1dECs{token}_5probe");
+        let lib = CrateIdentity::new("probe", crate_id_of_token("anYTrAQPVh4"));
+        let test = CrateIdentity::new("probe", crate_id_of_token("chaEfG29vzU"));
+        assert_eq!(
+            symbol_key(&symbol("anYTrAQPVh4"), &lib),
+            symbol_key(&symbol("chaEfG29vzU"), &test)
+        );
+        assert_eq!(lib.disambiguator(), test.disambiguator());
+        // Another crate's id fragment, another crate name and other code still differ.
+        assert_ne!(
+            symbol_key(&symbol("anYTrAQPVh4"), &lib),
+            symbol_key(&symbol("zzzzzzzzzzz"), &lib)
+        );
+        let other = CrateIdentity::new("other", 9);
+        assert_ne!(lib.disambiguator(), other.disambiguator());
+        assert_ne!(
+            symbol_key("_RNvCs1_11cuda_device1f", &lib),
+            symbol_key("_RNvCs1_11cuda_device1g", &lib)
+        );
+    }
+
+    #[test]
+    fn crate_id_rewrite_survives_chunk_boundaries() {
+        use std::fmt::Write as _;
+        let identity = CrateIdentity::new("probe", crate_id_of_token("anYTrAQPVh4"));
+        let text = "a_RNvCsanYTrAQPVh4_5probe1fb_RNvCsanYTrAQPVh4_5probeCsanYTrAQPVh4_5probe";
+        let digest = |chunk: usize| {
+            let mut hasher = Sha256::new();
+            let mut writer = HashWriter::new(&mut hasher, &identity);
+            for piece in text.as_bytes().chunks(chunk) {
+                writer
+                    .write_str(std::str::from_utf8(piece).unwrap())
+                    .unwrap();
+            }
+            writer.drain(true);
+            hex(&hasher.finalize())
+        };
+        let expected = hex(&Sha256::digest(
+            text.replace("CsanYTrAQPVh4_5probe", "Cs_5probe"),
+        ));
+        for chunk in [1, 2, 7, 19, 20, 21, text.len()] {
+            assert_eq!(digest(chunk), expected, "chunk size {chunk}");
+        }
     }
 
     fn scratch_cache(limit_bytes: u64) -> PartitionCache {
