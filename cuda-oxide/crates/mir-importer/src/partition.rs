@@ -54,12 +54,16 @@
 //! different targets of one crate is never merged into one module (one binary
 //! embeds one target's device code), so the name-derived disambiguator keeps
 //! `__shared_mem_*` unique between the crates that do share a module.
+//! The same id also reorders rustc's mono items, so a group's functions are
+//! translated sorted by normalized symbol (`canonical_members`); the printed
+//! module, the key and the PTX then do not depend on the crate id.
 //! A Rust `static` reached from two groups would be duplicated, so that case
 //! is reported as unsupported and the caller falls back to the monolithic
 //! pipeline.
 //!
 //! A single group is the monolithic module itself (same module name and
-//! disambiguator, no merge), so its PTX is byte-identical to the monolithic
+//! disambiguator, no merge) with its functions in canonical order (see
+//! `canonical_members`), so its PTX is equivalent to the monolithic
 //! pipeline and the cache only adds whole-crate reuse. With several groups,
 //! `opt` sees a smaller module and may inline or schedule a shared helper
 //! differently, so an entry's PTX is equivalent but not always identical to
@@ -297,7 +301,11 @@ pub fn run_partitioned_pipeline(
             if let Err(error) = translate_functions(
                 &mut ctx,
                 module_op,
-                partition.members.iter().map(|&member| &functions[member]),
+                canonical_members(&partition.members, &crate_identity, |member| {
+                    &functions[member].export_name
+                })
+                .into_iter()
+                .map(|member| &functions[member]),
                 config,
                 &mut kernel_launch_bounds,
             ) {
@@ -335,9 +343,10 @@ pub fn run_partitioned_pipeline(
             misses += 1;
             if std::env::var_os("CUDA_OXIDE_TIMINGS").is_some() {
                 eprintln!(
-                    "[oxide-partition] group {index} `{}`: {} functions, cache miss",
+                    "[oxide-partition] group {index} `{}`: {} functions, cache miss (key {})",
                     partition.name,
-                    partition.members.len()
+                    partition.members.len(),
+                    &key[..16]
                 );
             }
             if job_tx
@@ -586,6 +595,20 @@ impl CrateIdentity {
         }
     }
 
+    /// `symbol` with this crate's id fragment replaced by the fixed one.
+    fn normalize(&self, symbol: &str) -> String {
+        let mut out = Vec::with_capacity(symbol.len());
+        let bytes = symbol.as_bytes();
+        let mut at = 0;
+        while let Some(found) = find(&bytes[at..], &self.needle) {
+            out.extend_from_slice(&bytes[at..at + found]);
+            out.extend_from_slice(&self.replacement);
+            at += found + self.needle.len();
+        }
+        out.extend_from_slice(&bytes[at..]);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// Module disambiguator shared by every target of this crate.
     fn disambiguator(&self) -> u64 {
         let digest = Sha256::new()
@@ -594,6 +617,26 @@ impl CrateIdentity {
             .finalize();
         u64::from_le_bytes(digest[..8].try_into().expect("sha256 has 32 bytes"))
     }
+}
+
+/// Group members in canonical order: sorted by symbol with the crate id
+/// fragment normalized (ties keep collection order). rustc's mono-item order
+/// depends on the crate id, so the collection order of one group differs
+/// between the cargo targets of a crate; translating in this order makes the
+/// printed module (hence the key, the `__shared_mem_N` numbering and the PTX)
+/// independent of the crate id. Function order inside a module carries no
+/// semantics: calls resolve by symbol.
+fn canonical_members<'a>(
+    members: &[usize],
+    identity: &CrateIdentity,
+    symbol: impl Fn(usize) -> &'a str,
+) -> Vec<usize> {
+    let mut keyed: Vec<(String, usize)> = members
+        .iter()
+        .map(|&member| (identity.normalize(symbol(member)), member))
+        .collect();
+    keyed.sort();
+    keyed.into_iter().map(|(_, member)| member).collect()
 }
 
 /// rustc's `push_integer_62` body for `n`: `_` for 0, else base62(n - 1) + `_`.
@@ -1451,6 +1494,28 @@ mod tests {
             symbol_key("_RNvCs1_11cuda_device1f", &lib),
             symbol_key("_RNvCs1_11cuda_device1g", &lib)
         );
+    }
+
+    #[test]
+    fn member_order_ignores_collection_order_and_crate_id() {
+        let symbol = |token: &str, name: &str| format!("_RNvCs{token}_5probe{}{name}", name.len());
+        let lib = CrateIdentity::new("probe", crate_id_of_token("anYTrAQPVh4"));
+        let test = CrateIdentity::new("probe", crate_id_of_token("chaEfG29vzU"));
+        let names = ["k6144", "k5120", "helper", "k5120b"];
+        let lib_names: Vec<String> = names.iter().map(|n| symbol("anYTrAQPVh4", n)).collect();
+        // The other target collects the same functions in another order.
+        let test_names: Vec<String> = [2usize, 1, 3, 0]
+            .iter()
+            .map(|&i| symbol("chaEfG29vzU", names[i]))
+            .collect();
+        let sorted = |identity: &CrateIdentity, all: &[String]| -> Vec<String> {
+            let members: Vec<usize> = (0..all.len()).collect();
+            canonical_members(&members, identity, |i| all[i].as_str())
+                .into_iter()
+                .map(|i| identity.normalize(&all[i]))
+                .collect()
+        };
+        assert_eq!(sorted(&lib, &lib_names), sorted(&test, &test_names));
     }
 
     #[test]
