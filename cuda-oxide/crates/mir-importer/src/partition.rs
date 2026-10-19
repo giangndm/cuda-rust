@@ -173,6 +173,7 @@ const KEY_NEUTRAL_ENV: &[&str] = &[
 struct Job {
     index: usize,
     key: String,
+    kernels: Vec<String>,
     ctx: Context,
     module: Ptr<Operation>,
 }
@@ -204,14 +205,11 @@ pub fn run_partitioned_pipeline(
     }
     crate::translator::facts::set_known_defs(known_defs);
     std::fs::create_dir_all(&config.output_dir).map_err(export_error)?;
-    let work_dir = config
-        .output_dir
-        .join(".oxide-partitions")
-        .join(&config.output_name);
+    let crate_disambiguator = config.module_disambiguator.unwrap_or(0);
+    let work_dir = partition_work_dir(&config.output_dir, &config.output_name, crate_disambiguator);
     std::fs::create_dir_all(&work_dir).map_err(export_error)?;
 
     let base_backend = backend_options_for(config);
-    let crate_disambiguator = config.module_disambiguator.unwrap_or(0);
     let cache = PartitionCache::from_env();
     let options_fingerprint = options_fingerprint(config, device_externs);
     let jobs = codegen_jobs();
@@ -302,7 +300,18 @@ pub fn run_partitioned_pipeline(
                     crate_disambiguator
                 },
             );
-            if let Some(hit) = cache.as_ref().and_then(|cache| cache.load(&key)) {
+            let kernels: Vec<String> = partition
+                .members
+                .iter()
+                .map(|&member| &functions[member])
+                .filter(|function| function.is_kernel)
+                .map(|function| function.export_name.clone())
+                .collect();
+            if let Some(hit) = cache
+                .as_ref()
+                .and_then(|cache| cache.load(&key))
+                .filter(|hit| defines_kernels(&hit.ptx, &kernels))
+            {
                 hits += 1;
                 results[index] = Some(Ok(hit));
                 continue;
@@ -319,6 +328,7 @@ pub fn run_partitioned_pipeline(
                 .send(Job {
                     index,
                     key,
+                    kernels,
                     ctx,
                     module: module_op,
                 })
@@ -380,17 +390,22 @@ pub fn run_partitioned_pipeline(
             Err(reason) => return Ok(PartitionedOutcome::Unsupported(reason)),
         }
     };
+    // The artifact is read back from this compilation's own directory; the
+    // conventional `<output_dir>/<name>.ptx` copy is for people and tools, and
+    // a crate's library and test targets may write it concurrently.
+    let artifact_path = work_dir.join(format!("{}.ptx", config.output_name));
+    std::fs::write(&artifact_path, &merged).map_err(export_error)?;
     let ptx_path = config
         .output_dir
         .join(format!("{}.ptx", config.output_name));
-    std::fs::write(&ptx_path, merged).map_err(export_error)?;
+    let _ = std::fs::write(&ptx_path, &merged);
     cuda_oxide_codegen::timing::record("partitions: merge PTX", merge_start);
     if let Some(cache) = cache.as_ref() {
         cache.evict();
     }
 
     Ok(PartitionedOutcome::Compiled(CompilationResult {
-        artifact_path: ptx_path.clone(),
+        artifact_path,
         artifact_kind: CompilationArtifactKind::Ptx,
         ll_path: work_dir,
         ptx_path,
@@ -400,6 +415,23 @@ pub fn run_partitioned_pipeline(
             .into_iter()
             .collect::<BTreeMap<String, KernelLaunchBounds>>(),
     }))
+}
+
+/// Per-compilation scratch directory. A crate's library and its test harness
+/// share `output_dir` and the crate name but not the disambiguator (rustc's
+/// stable crate id covers `-C metadata`), and cargo builds them concurrently.
+fn partition_work_dir(output_dir: &Path, output_name: &str, disambiguator: u64) -> PathBuf {
+    output_dir
+        .join(".oxide-partitions")
+        .join(format!("{output_name}-{disambiguator:016x}"))
+}
+
+/// Whether `ptx` defines every kernel entry in `kernels`: rejects a PTX file
+/// or cache entry that does not belong to the group.
+fn defines_kernels(ptx: &str, kernels: &[String]) -> bool {
+    kernels
+        .iter()
+        .all(|kernel| ptx.contains(&format!(".entry {kernel}(")))
 }
 
 fn export_error(error: std::io::Error) -> PipelineError {
@@ -440,6 +472,7 @@ fn compile_group(
     let Job {
         index,
         key,
+        kernels,
         mut ctx,
         module,
     } = job;
@@ -486,6 +519,12 @@ fn compile_group(
         ));
     }
     let ptx = std::fs::read_to_string(&ptx_path).map_err(export_error)?;
+    if !defines_kernels(&ptx, &kernels) {
+        return Err(PipelineError::PtxGeneration(format!(
+            "{} does not define the kernels of its group; was it overwritten concurrently?",
+            ptx_path.display()
+        )));
+    }
     if std::env::var_os("CUDA_OXIDE_KEEP_PARTITION_IR").is_none() {
         for path in &intermediates {
             let _ = std::fs::remove_file(path);
@@ -1064,6 +1103,23 @@ mod tests {
     #[test]
     fn duplicate_kernels_fail() {
         assert!(merge_group_ptx(&[GROUP_A, GROUP_A]).is_err());
+    }
+
+    #[test]
+    fn library_and_test_targets_get_separate_work_dirs() {
+        let root = Path::new("out");
+        assert_ne!(
+            partition_work_dir(root, "ninfer_nn", 1),
+            partition_work_dir(root, "ninfer_nn", 2)
+        );
+    }
+
+    #[test]
+    fn kernel_check_rejects_foreign_ptx() {
+        let kernels = vec!["a".to_string()];
+        assert!(defines_kernels(GROUP_A, &kernels));
+        assert!(!defines_kernels(GROUP_B, &kernels));
+        assert!(defines_kernels(GROUP_B, &[]));
     }
 
     #[test]
