@@ -999,6 +999,7 @@ dependencies = [
  "pliron-derive",
  "reserved-oxide-symbols",
  "rustc-hash 2.1.2",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

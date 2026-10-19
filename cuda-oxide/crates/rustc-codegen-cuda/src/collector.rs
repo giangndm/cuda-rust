@@ -396,6 +396,11 @@ pub struct CollectionResult<'tcx> {
     /// dependency. Cubin materialization must reject this case until it can
     /// reproduce the same cross-crate linking semantics.
     pub requires_ptx_bundle_merge: bool,
+
+    /// Device call-graph edges `(caller, callee)` by mangled symbol name,
+    /// including edges to callees discovered earlier. Partitioned device
+    /// codegen uses them to compute each kernel group's reachable set.
+    pub call_edges: Vec<(String, String)>,
 }
 
 /// Counts kernel functions across all codegen units.
@@ -1080,9 +1085,20 @@ struct DeviceCollector<'tcx> {
     warned_dynamic_shared_array: bool,
     /// Print progress to stderr.
     verbose: bool,
+    /// Mangled name of the function whose body is being walked.
+    current_caller: Option<String>,
+    /// Recorded `(caller, callee)` edges by mangled name.
+    call_edges: Vec<(String, String)>,
 }
 
 impl<'tcx> DeviceCollector<'tcx> {
+    fn record_edge(&mut self, callee_mangled: &str) {
+        if let Some(caller) = self.current_caller.as_ref() {
+            self.call_edges
+                .push((caller.clone(), callee_mangled.to_string()));
+        }
+    }
+
     fn new(tcx: TyCtxt<'tcx>, verbose: bool) -> Self {
         Self {
             tcx,
@@ -1095,6 +1111,8 @@ impl<'tcx> DeviceCollector<'tcx> {
             seen_device_externs: HashSet::new(),
             warned_dynamic_shared_array: false,
             verbose,
+            current_caller: None,
+            call_edges: Vec::new(),
         }
     }
 
@@ -1156,6 +1174,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             // enqueued function gets an entry; the fallback only guards
             // against future call paths that forget to record one.
             let mangled = self.tcx.symbol_name(func.instance).name.to_string();
+            self.current_caller = Some(mangled.clone());
             let ctx = self
                 .discovery
                 .get(&mangled)
@@ -1254,6 +1273,7 @@ impl<'tcx> DeviceCollector<'tcx> {
             functions: self.result,
             device_externs: self.device_externs,
             requires_ptx_bundle_merge: false,
+            call_edges: self.call_edges,
         }
     }
 
@@ -1386,6 +1406,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
 
         let mangled = self.tcx.symbol_name(drop_instance).name.to_string();
+        self.record_edge(&mangled);
         if self.seen.contains(&mangled) {
             return;
         }
@@ -1661,6 +1682,7 @@ impl<'tcx> DeviceCollector<'tcx> {
 
         // Skip already-seen monomorphizations (use mangled name as unique key)
         let mangled = self.tcx.symbol_name(resolved).name.to_string();
+        self.record_edge(&mangled);
         if self.seen.contains(&mangled) {
             return;
         }
@@ -1949,6 +1971,7 @@ impl<'tcx> DeviceCollector<'tcx> {
         }
 
         let mangled = self.tcx.symbol_name(instance).name.to_string();
+        self.record_edge(&mangled);
         if self.seen.contains(&mangled) {
             return;
         }

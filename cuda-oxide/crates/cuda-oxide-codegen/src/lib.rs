@@ -31,6 +31,8 @@ mod pipeline;
 mod prep;
 mod ptx;
 mod target;
+#[doc(hidden)]
+pub mod timing;
 mod verify;
 mod warp_aggregate_constant_fp_atomics;
 

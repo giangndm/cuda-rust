@@ -889,6 +889,7 @@ impl From<std::io::Error> for DeviceCodegenError {
 pub fn generate_device_code<'tcx>(
     tcx: TyCtxt<'tcx>,
     functions: &[CollectedFunction<'tcx>],
+    call_edges: &[(String, String)],
     device_externs: &[DeviceExternDecl],
     config: &DeviceCodegenConfig,
 ) -> Result<DeviceCodegenResult, DeviceCodegenError> {
@@ -1081,6 +1082,8 @@ pub fn generate_device_code<'tcx>(
         .map(|func| crate::collector::device_mono_reachability(tcx, func.instance))
         .collect();
 
+    let groups = kernel_groups(tcx, functions, call_edges);
+
     let result = rustc_internal::run(tcx, || {
         let mut debug_global_variables = BTreeMap::new();
         for owned in &static_debug_identities {
@@ -1133,13 +1136,13 @@ pub fn generate_device_code<'tcx>(
         // same shared predicate (collector::process_drop_place), so this
         // filter is a final guard that keeps translation in lockstep with
         // emission if a future collection path forgets the check.
-        let stable_functions: Vec<mir_importer::CollectedFunction> = functions
+        let stable_slots: Vec<Option<mir_importer::CollectedFunction>> = functions
             .iter()
             .zip(export_names.iter())
             .zip(debug_scope_maps.iter())
             .zip(inline_always_flags.iter())
             .zip(device_mono_reachability.iter())
-            .filter_map(
+            .map(
                 |(
                     (((func, (export_name, is_kernel)), debug_source_scopes), is_inline_always),
                     reachability,
@@ -1177,6 +1180,15 @@ pub fn generate_device_code<'tcx>(
                 },
             )
             .collect();
+        // Original collection index -> index among the translated functions.
+        let mut stable_index = Vec::with_capacity(stable_slots.len());
+        let mut stable_functions = Vec::with_capacity(stable_slots.len());
+        for slot in stable_slots {
+            stable_index.push(slot.as_ref().map(|_| stable_functions.len()));
+            if let Some(function) = slot {
+                stable_functions.push(function);
+            }
+        }
 
         // Check for NVVM IR mode (set by cargo oxide --emit-nvvm-ir)
         let emit_nvvm_ir = std::env::var("CUDA_OXIDE_EMIT_NVVM_IR").is_ok();
@@ -1240,6 +1252,37 @@ pub fn generate_device_code<'tcx>(
             index_trait: lang_items.index_trait().map(rustc_internal::stable),
             index_mut_trait: lang_items.index_mut_trait().map(rustc_internal::stable),
         };
+
+        if let Some(groups) = groups.as_ref() {
+            let partitions: Vec<mir_importer::partition::FunctionPartition> = groups
+                .iter()
+                .map(|group| mir_importer::partition::FunctionPartition {
+                    name: group.name.clone(),
+                    members: group
+                        .members
+                        .iter()
+                        .filter_map(|&member| stable_index[member])
+                        .collect(),
+                })
+                .collect();
+            match mir_importer::partition::run_partitioned_pipeline(
+                &stable_functions,
+                &partitions,
+                &stable_device_externs,
+                &pipeline_config,
+                known_defs,
+            ) {
+                Ok(mir_importer::partition::PartitionedOutcome::Compiled(result)) => {
+                    return Ok(result);
+                }
+                Ok(mir_importer::partition::PartitionedOutcome::Unsupported(reason)) => {
+                    eprintln!(
+                        "[rustc_codegen_cuda] note: partitioned device codegen unavailable ({reason}); compiling one module"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
         // Run the cuda-oxide pipeline!
         // Rust MIR → `dialect-mir` → mem2reg → unroll → LLVM dialect → LLVM IR → PTX.
@@ -1305,6 +1348,63 @@ pub fn generate_device_code<'tcx>(
             stable_mir_err
         ))),
     }
+}
+
+/// Kernel groups for partitioned device codegen: `(group name, member
+/// indices)`, each group holding its kernels and every collected function
+/// they reach through `call_edges`. `None` selects the monolithic pipeline.
+///
+/// `CUDA_OXIDE_PARTITION` picks the grouping: `module` (default: kernels
+/// sharing their enclosing Rust module, e.g. one `#[cuda_module]`), `kernel`
+/// (one group per kernel entry), `crate` (one group: the monolithic module,
+/// byte-identical PTX, cached as a whole) or `off` (no grouping, no cache).
+fn kernel_groups<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[CollectedFunction<'tcx>],
+    call_edges: &[(String, String)],
+) -> Option<Vec<mir_importer::partition::FunctionPartition>> {
+    let mode = std::env::var("CUDA_OXIDE_PARTITION").unwrap_or_else(|_| "module".to_string());
+    if mode == "off" || mode == "0" {
+        return None;
+    }
+    if mode == "crate" {
+        return Some(mir_importer::partition::whole_crate_group(functions.len()));
+    }
+    let index: HashMap<String, usize> = functions
+        .iter()
+        .enumerate()
+        .map(|(position, function)| {
+            (
+                tcx.symbol_name(function.instance).name.to_string(),
+                position,
+            )
+        })
+        .collect();
+    let edges: Vec<(usize, usize)> = call_edges
+        .iter()
+        .filter_map(|(caller, callee)| Some((*index.get(caller)?, *index.get(callee)?)))
+        .collect();
+    let mut roots: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (position, function) in functions.iter().enumerate() {
+        if !function.is_kernel {
+            continue;
+        }
+        let group = if mode == "kernel" {
+            function.export_name.clone()
+        } else {
+            let mut parent = tcx.parent(function.instance.def_id());
+            while tcx.def_kind(parent) != DefKind::Mod {
+                parent = tcx.parent(parent);
+            }
+            tcx.def_path_str(parent)
+        };
+        roots.entry(group).or_default().push(position);
+    }
+    Some(mir_importer::partition::group_functions(
+        functions.len(),
+        &edges,
+        roots,
+    ))
 }
 
 fn device_debug_kind(rustc_debug: DebugInfo) -> llvm_export::export::DebugKind {

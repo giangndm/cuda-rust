@@ -694,14 +694,17 @@ impl CodegenBackend for CudaCodegenBackend {
                             *g = Some(Backtrace::capture());
                         }
                     }));
+                    let stage = std::time::Instant::now();
                     let r = catch_unwind(AssertUnwindSafe(|| {
                         device_codegen::generate_device_code(
                             tcx,
                             device_functions,
+                            &collection_result.call_edges,
                             &collection_result.device_externs,
                             &device_config,
                         )
                     }));
+                    mir_importer::timing::record("device codegen total", stage);
                     std::panic::set_hook(prev_hook);
                     (r, bt_slot)
                 };

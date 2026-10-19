@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 linkme = { workspace = true }
 once_cell = { workspace = true }
 combine = { workspace = true }
+sha2 = { workspace = true }
 
 [package.metadata.rust-analyzer]
 rustc_private = true

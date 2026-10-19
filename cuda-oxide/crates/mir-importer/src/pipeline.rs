@@ -60,7 +60,7 @@ use rustc_public::ty::Ty;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-fn stderr_pipeline_trace(message: &str) {
+pub(crate) fn stderr_pipeline_trace(message: &str) {
     eprintln!("{message}");
 }
 
@@ -436,7 +436,7 @@ fn attach_debug_global_variables(
 ///
 /// Environment-derived compatibility options are read once at the rustc
 /// frontend boundary. Explicit pipeline configuration retains precedence.
-fn backend_options_for(config: &PipelineConfig) -> BackendOptions {
+pub(crate) fn backend_options_for(config: &PipelineConfig) -> BackendOptions {
     let mut backend_options =
         BackendOptions::from_env_with_device_hint(config.device_arch_hint.clone());
     if config.target_arch.is_some() {
@@ -516,75 +516,16 @@ pub fn run_pipeline(
     let module = pliron::builtin::ops::ModuleOp::new(&mut ctx, module_name);
     let module_op_ptr = module.get_operation();
 
-    let mut legaliser = Legaliser::default();
     let mut kernel_launch_bounds = BTreeMap::new();
 
     // Step 3: Translate all functions
-    for func in functions {
-        if config.verbose {
-            eprintln!(
-                "Translating {}: {}",
-                if func.is_kernel {
-                    "kernel"
-                } else {
-                    "device fn"
-                },
-                func.export_name
-            );
-        }
-
-        let body = func
-            .instance
-            .body()
-            .ok_or_else(|| PipelineError::NoBody(func.export_name.clone()))?;
-
-        let func_op_ptr = crate::translator::body::translate_body(
-            &mut ctx,
-            &body,
-            &func.instance,
-            func.rustc_mir_block_count,
-            &func.rustc_mono_successors,
-            func.is_kernel,
-            func.is_inline_always,
-            Some(&func.export_name),
-            &mut legaliser,
-            config.debug_kind,
-            func.debug_source_scopes.as_ref(),
-            func.statement_debug_info.as_ref(),
-        )
-        .map_err(|e| {
-            // Use .disp(&ctx) for rich error formatting with location and backtrace
-            PipelineError::Translation(format!("{}: {}", func.export_name, e.disp(&ctx)))
-        })?;
-
-        if config.debug_kind.variables_enabled() {
-            attach_debug_global_variables(&mut ctx, func_op_ptr, &config.debug_global_variables);
-        }
-
-        // Dump the per-function IR BEFORE verification so users can see
-        // what the translator produced even when verification fails. If we
-        // verified first and bailed, `--show-mir-dialect` / `CUDA_OXIDE_DUMP_MIR`
-        // would silently print nothing for the offending function.
-        if config.show_mir_dialect {
-            eprintln!(
-                "\n=== dialect-mir func: {} (pre-verify) ===",
-                func.export_name
-            );
-            eprintln!("{}", func_op_ptr.deref(&ctx).disp(&ctx));
-        }
-
-        verify_operation(&ctx, func_op_ptr, &func.export_name)?;
-
-        if func.is_kernel
-            && let Some(bounds) = launch_bounds_from_mir_func(&ctx, func_op_ptr)
-        {
-            kernel_launch_bounds.insert(func.export_name.clone(), bounds);
-        }
-
-        // Append to module
-        append_to_module(&ctx, module_op_ptr, func_op_ptr);
-    }
-
+    translate_functions(
+        &mut ctx,
+        module_op_ptr,
+        functions.iter(),
+        config,
+        &mut kernel_launch_bounds,
+    )?;
     let ll_path = config.output_dir.join(format!("{}.ll", config.output_name));
     let ptx_path = config
         .output_dir
@@ -643,6 +584,85 @@ pub fn run_pipeline(
             kernel_launch_bounds,
         }),
     }
+}
+
+/// Translate `functions` into `module_op_ptr`, verifying each function and
+/// recording kernel launch bounds. Shared by the monolithic and the
+/// partitioned pipeline so both translate a function identically.
+pub(crate) fn translate_functions<'f>(
+    ctx: &mut Context,
+    module_op_ptr: pliron::context::Ptr<Operation>,
+    functions: impl Iterator<Item = &'f CollectedFunction>,
+    config: &PipelineConfig,
+    kernel_launch_bounds: &mut BTreeMap<String, KernelLaunchBounds>,
+) -> Result<(), PipelineError> {
+    let mut legaliser = Legaliser::default();
+    for func in functions {
+        if config.verbose {
+            eprintln!(
+                "Translating {}: {}",
+                if func.is_kernel {
+                    "kernel"
+                } else {
+                    "device fn"
+                },
+                func.export_name
+            );
+        }
+
+        let body = func
+            .instance
+            .body()
+            .ok_or_else(|| PipelineError::NoBody(func.export_name.clone()))?;
+
+        let func_op_ptr = crate::translator::body::translate_body(
+            ctx,
+            &body,
+            &func.instance,
+            func.rustc_mir_block_count,
+            &func.rustc_mono_successors,
+            func.is_kernel,
+            func.is_inline_always,
+            Some(&func.export_name),
+            &mut legaliser,
+            config.debug_kind,
+            func.debug_source_scopes.as_ref(),
+            func.statement_debug_info.as_ref(),
+        )
+        .map_err(|e| {
+            // Use .disp(ctx) for rich error formatting with location and backtrace
+            PipelineError::Translation(format!("{}: {}", func.export_name, e.disp(ctx)))
+        })?;
+
+        if config.debug_kind.variables_enabled() {
+            attach_debug_global_variables(ctx, func_op_ptr, &config.debug_global_variables);
+        }
+
+        // Dump the per-function IR BEFORE verification so users can see
+        // what the translator produced even when verification fails. If we
+        // verified first and bailed, `--show-mir-dialect` / `CUDA_OXIDE_DUMP_MIR`
+        // would silently print nothing for the offending function.
+        if config.show_mir_dialect {
+            eprintln!(
+                "\n=== dialect-mir func: {} (pre-verify) ===",
+                func.export_name
+            );
+            eprintln!("{}", func_op_ptr.deref(ctx).disp(ctx));
+        }
+
+        verify_operation(ctx, func_op_ptr, &func.export_name)?;
+
+        if func.is_kernel
+            && let Some(bounds) = launch_bounds_from_mir_func(ctx, func_op_ptr)
+        {
+            kernel_launch_bounds.insert(func.export_name.clone(), bounds);
+        }
+
+        // Append to module
+        append_to_module(ctx, module_op_ptr, func_op_ptr);
+    }
+
+    Ok(())
 }
 
 fn launch_bounds_from_mir_func(

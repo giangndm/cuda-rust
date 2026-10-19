@@ -94,6 +94,7 @@ extern crate rustc_span;
 pub const DEVICE_RUNTIME_CHECKS_VALUE: bool = false;
 
 pub mod error;
+pub mod partition;
 pub mod pipeline;
 // Crate-internal: every caller reaches the translator through `pipeline`, and
 // the handful of predicates outsiders need are re-exported below. Keeping the
@@ -101,6 +102,8 @@ pub mod pipeline;
 // under it, since every item in it would count as reachable API.
 pub(crate) mod translator;
 
+#[doc(hidden)]
+pub use cuda_oxide_codegen::timing;
 pub use error::{TranslationErr, TranslationResult};
 pub use pipeline::{
     CollectedFunction, CompilationArtifactKind, CompilationResult, DebugGlobalVariableIdentity,
