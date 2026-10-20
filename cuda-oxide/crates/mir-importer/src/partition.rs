@@ -40,6 +40,12 @@
 //!
 //! Every group gets its own module disambiguator, so counter-named
 //! module-scope symbols (`__shared_mem_*`) stay unique in the merged module.
+//! A group's printed module is named after that disambiguator
+//! (`<crate>_g<hex>`), not after its position: groups are ordered by name, so
+//! an extra group (a lib-test's test kernels) or a removed one would shift the
+//! positions of the others and change their printed IR, hence their keys.
+//! Scratch files keep the position (`p<index>`) because they live in the
+//! per-compilation directory; the merge order stays the group-name order.
 //!
 //! The key must not depend on which cargo target of a crate is compiled. A
 //! `cfg(test)` lib-test build or a build with another cargo feature has the
@@ -230,6 +236,20 @@ pub fn run_partitioned_pipeline(
     let crate_identity = CrateIdentity::new(&config.output_name, crate_id);
     let crate_disambiguator = crate_identity.disambiguator();
     std::fs::create_dir_all(&work_dir).map_err(export_error)?;
+    let group_disambiguators: Vec<u64> = if partitions.len() > 1 {
+        partitions
+            .iter()
+            .map(|partition| group_disambiguator(crate_disambiguator, &partition.name))
+            .collect()
+    } else {
+        vec![crate_disambiguator]
+    };
+    if let Some(clash) = duplicate_disambiguator(partitions, &group_disambiguators) {
+        return Ok(PartitionedOutcome::Unsupported(format!(
+            "kernel groups `{}` and `{}` share a module disambiguator",
+            clash.0, clash.1
+        )));
+    }
 
     let base_backend = backend_options_for(config);
     let cache = PartitionCache::from_env();
@@ -256,6 +276,7 @@ pub fn run_partitioned_pipeline(
             let result_tx = result_tx.clone();
             let base_backend = &base_backend;
             let work_dir = &work_dir;
+            let group_disambiguators = &group_disambiguators;
             let cache = &cache;
             scope.spawn(move || {
                 loop {
@@ -263,11 +284,7 @@ pub fn run_partitioned_pipeline(
                     let Ok(job) = next else { break };
                     let index = job.index;
                     let mut backend = base_backend.clone();
-                    backend.module_disambiguator = Some(if partitions.len() > 1 {
-                        group_disambiguator(crate_disambiguator, &partitions[index].name)
-                    } else {
-                        crate_disambiguator
-                    });
+                    backend.module_disambiguator = Some(group_disambiguators[index]);
                     let result = compile_group(
                         job,
                         &backend,
@@ -292,7 +309,7 @@ pub fn run_partitioned_pipeline(
             let module_name: pliron::identifier::Identifier = if partitions.len() == 1 {
                 config.output_name.clone()
             } else {
-                format!("{}_p{index}", config.output_name)
+                group_module_name(&config.output_name, group_disambiguators[index])
             }
             .try_into()
             .unwrap_or_else(|_| "kernel".try_into().unwrap());
@@ -318,11 +335,7 @@ pub fn run_partitioned_pipeline(
                 module_op,
                 &options_fingerprint,
                 &crate_identity,
-                if partitions.len() > 1 {
-                    group_disambiguator(crate_disambiguator, &partition.name)
-                } else {
-                    crate_disambiguator
-                },
+                group_disambiguators[index],
             );
             let kernels: Vec<String> = partition
                 .members
@@ -483,6 +496,33 @@ fn group_disambiguator(crate_disambiguator: u64, group: &str) -> u64 {
         .chain_update(group.as_bytes())
         .finalize();
     u64::from_le_bytes(digest[..8].try_into().expect("sha256 has 32 bytes"))
+}
+
+/// Name of a group's printed module, derived from the group's own identity
+/// (its disambiguator, which hashes the crate name and the group name) rather
+/// than its index: adding or removing a group, or a test target's extra
+/// kernel groups, must not rename the other groups, because the module name
+/// is part of the printed IR the cache key hashes. Distinct groups have
+/// distinct disambiguators (checked by [`duplicate_disambiguator`]), so the
+/// names are unique within a crate.
+fn group_module_name(output_name: &str, disambiguator: u64) -> String {
+    format!("{output_name}_g{disambiguator:016x}")
+}
+
+/// The first pair of groups that share a disambiguator (a 64-bit hash
+/// collision), which would also collide their `__shared_mem_*` symbols.
+fn duplicate_disambiguator<'a>(
+    partitions: &'a [FunctionPartition],
+    disambiguators: &[u64],
+) -> Option<(&'a str, &'a str)> {
+    let mut seen: HashMap<u64, &str> = HashMap::new();
+    partitions
+        .iter()
+        .zip(disambiguators)
+        .find_map(|(partition, id)| {
+            seen.insert(*id, &partition.name)
+                .map(|first| (first, partition.name.as_str()))
+        })
 }
 
 /// Run every stage after translation for one group and cache its PTX.
@@ -658,12 +698,13 @@ fn base62_integer(n: u64) -> String {
 }
 
 /// `fmt::Write` sink that feeds a hasher, so the printed module is never
-/// materialized as one string. It rewrites every occurrence of the crate's
-/// own mangled-path prefix (which may straddle two chunks) to its fixed form.
+/// materialized as one string. It hashes whole lines, rewriting every
+/// occurrence of the crate's own mangled-path prefix to its fixed form and
+/// scrubbing the interner ids of shared-allocation keys (see [`scrub_ids`]).
 struct HashWriter<'a> {
     hasher: &'a mut Sha256,
     identity: &'a CrateIdentity,
-    /// Bytes that may still start a match.
+    /// The unfinished last line.
     carry: Vec<u8>,
 }
 
@@ -676,25 +717,72 @@ impl<'a> HashWriter<'a> {
         }
     }
 
-    /// Hash every byte not held back; `last` flushes the held-back tail.
+    /// Hash every complete line; `last` also flushes the unfinished one.
     fn drain(&mut self, last: bool) {
+        let end = if last {
+            self.carry.len()
+        } else {
+            match self.carry.iter().rposition(|&byte| byte == b'\n') {
+                Some(newline) => newline + 1,
+                None => return,
+            }
+        };
+        let rest = self.carry.split_off(end);
+        let block = std::mem::replace(&mut self.carry, rest);
         let needle = &self.identity.needle;
-        let mut data = std::mem::take(&mut self.carry);
         let mut start = 0;
-        while let Some(at) = find(&data[start..], needle) {
-            self.hasher.update(&data[start..start + at]);
+        while let Some(at) = find(&block[start..], needle) {
+            self.hash_lines(&block[start..start + at]);
             self.hasher.update(&self.identity.replacement);
             start += at + needle.len();
         }
-        let keep_from = if last {
-            data.len()
-        } else {
-            // A match can begin only within the last `needle.len() - 1` bytes.
-            start.max(data.len().saturating_sub(needle.len() - 1))
-        };
-        self.hasher.update(&data[start..keep_from]);
-        self.carry = data.split_off(keep_from);
+        self.hash_lines(&block[start..]);
     }
+
+    /// Hash `bytes`, scrubbing the lines that carry a shared-allocation key.
+    fn hash_lines(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let line_end = rest
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(rest.len(), |at| at + 1);
+            let (line, tail) = rest.split_at(line_end);
+            if find(line, ALLOC_KEY_ATTR.as_bytes()).is_some() {
+                self.hasher
+                    .update(scrub_ids(&String::from_utf8_lossy(line)).as_bytes());
+            } else {
+                self.hasher.update(line);
+            }
+            rest = tail;
+        }
+    }
+}
+
+/// Attribute that marks a `mir.shared_alloc` line whose key embeds stable-MIR
+/// interner ids.
+const ALLOC_KEY_ATTR: &str = "alloc_key: builtin.string";
+
+/// Drop the digits of stable-MIR interner ids (`id: 114`, `AllocId(0, ..)`,
+/// `MirConstId(71, ..)`) from a printed shared-allocation key. Without debug
+/// info the key is the `Debug` form of the constant, which names its types and
+/// allocation by interning order; that order depends on everything else the
+/// cargo target interned, so a lib-test build would otherwise miss the cache
+/// for every group with shared memory. The scrub applies to the hash only; the
+/// compiled module keeps the exact key.
+fn scrub_ids(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(at) = ["id: ", "Id("]
+        .iter()
+        .filter_map(|marker| rest.find(marker).map(|at| at + marker.len()))
+        .min()
+    {
+        out.push_str(&rest[..at]);
+        rest = rest[at..].trim_start_matches(|c: char| c.is_ascii_digit());
+    }
+    out.push_str(rest);
+    out
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1276,6 +1364,51 @@ mod tests {
         );
     }
 
+    fn named(names: &[&str]) -> Vec<FunctionPartition> {
+        names
+            .iter()
+            .map(|name| FunctionPartition {
+                name: name.to_string(),
+                members: vec![],
+            })
+            .collect()
+    }
+
+    fn module_names(crate_name: &str, groups: &[&str]) -> Vec<(String, String)> {
+        let crate_id = group_disambiguator(7, "");
+        groups
+            .iter()
+            .map(|group| {
+                let id = group_disambiguator(crate_id, group);
+                (group.to_string(), group_module_name(crate_name, id))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn group_module_names_do_not_depend_on_group_positions() {
+        let lib = module_names("probe", &["add", "mul", "shared"]);
+        let test = module_names("probe", &["a0_tests", "add", "mul", "shared"]);
+        assert_eq!(lib[..], test[1..]);
+        assert_eq!(lib, module_names("probe", &["add", "mul", "shared"]));
+    }
+
+    #[test]
+    fn group_module_names_are_unique_and_valid_identifiers() {
+        let names = module_names("probe", &["add", "mul", "a::b", "a_b"]);
+        let unique: BTreeSet<_> = names.iter().map(|(_, name)| name).collect();
+        assert_eq!(unique.len(), names.len());
+        for (_, name) in &names {
+            assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        }
+        let groups = named(&["add", "mul"]);
+        assert_eq!(duplicate_disambiguator(&groups, &[1, 2]), None);
+        assert_eq!(
+            duplicate_disambiguator(&groups, &[3, 3]),
+            Some(("add", "mul"))
+        );
+    }
+
     #[test]
     fn kernel_check_rejects_foreign_ptx() {
         let kernels = vec!["a".to_string()];
@@ -1516,6 +1649,33 @@ mod tests {
                 .collect()
         };
         assert_eq!(sorted(&lib, &lib_names), sorted(&test, &test_names));
+    }
+
+    #[test]
+    fn shared_allocation_keys_ignore_interner_ids() {
+        let line = |id: u32| {
+            format!(
+                "  v1 = mir.shared_alloc () [elem_type: f32, alloc_key: builtin.string \
+                 \"Ty {{ id: {id} }} AllocId({id}, ThreadLocalIndex)\"]\n  v2 = id: {id}\n"
+            )
+        };
+        let identity = CrateIdentity::new("probe", 1);
+        let digest = |text: &str| {
+            let mut hasher = Sha256::new();
+            let mut writer = HashWriter::new(&mut hasher, &identity);
+            std::fmt::Write::write_str(&mut writer, text).unwrap();
+            writer.drain(true);
+            hex(&hasher.finalize())
+        };
+        let (first, second) = (line(114), line(120));
+        // Only the line with the allocation key is scrubbed.
+        assert_ne!(digest(&first), digest(&second));
+        let key_only = |text: &str| text.lines().next().unwrap().to_string() + "\n";
+        assert_eq!(digest(&key_only(&first)), digest(&key_only(&second)));
+        assert_eq!(
+            scrub_ids("Ty { id: 7 } AllocId(0, X) id: x"),
+            "Ty { id:  } AllocId(, X) id: x"
+        );
     }
 
     #[test]
