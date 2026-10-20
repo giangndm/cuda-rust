@@ -287,6 +287,7 @@
 //! | `CUDA_OXIDE_PTX_DIR`              | Override PTX output directory        |
 //! | `CUDA_OXIDE_TARGET`               | Override GPU target (e.g., `sm_90a`) |
 //! | `CUDA_OXIDE_DEVICE_CODEGEN_CRATE` | Filter device owner crate names      |
+//! | `CUDA_OXIDE_DEVICE_ONLY`          | Owner crates skip host codegen       |
 //!
 //! ## Module Structure
 //!
@@ -364,7 +365,8 @@ pub struct CudaCodegenBackend {
 }
 
 struct CudaOngoingCodegen {
-    host: Box<dyn Any>,
+    /// `None` in device-only mode (`CUDA_OXIDE_DEVICE_ONLY`): no host objects.
+    host: Option<Box<dyn Any>>,
     artifact_objects: Vec<PathBuf>,
 }
 
@@ -796,7 +798,13 @@ impl CodegenBackend for CudaCodegenBackend {
 
             // Step 3: Delegate ALL host codegen to LLVM backend
             // (No logging here - it fires for every crate including dependencies)
-            let host_result = self.llvm_backend.codegen_crate(tcx);
+            // Device-only mode: a crate that owns device code skips host codegen and its rlib
+            // carries only metadata plus the artifact object. For builds whose host objects are
+            // never linked (a build script extracting the bundle); build scripts, proc-macros
+            // and crates without device code still go through LLVM.
+            let device_only =
+                has_device_code && std::env::var_os("CUDA_OXIDE_DEVICE_ONLY").is_some();
+            let host_result = (!device_only).then(|| self.llvm_backend.codegen_crate(tcx));
 
             // Return the LLVM backend's result
             Box::new(CudaOngoingCodegen {
@@ -817,13 +825,19 @@ impl CodegenBackend for CudaCodegenBackend {
         let ongoing = *ongoing_codegen
             .downcast::<CudaOngoingCodegen>()
             .expect("rustc_codegen_cuda received unexpected ongoing codegen state");
-        let (mut compiled_modules, work_products) = self.llvm_backend.join_codegen(
-            ongoing.host,
-            sess,
-            incr_comp_session,
-            outputs,
-            crate_info,
-        );
+        let (mut compiled_modules, work_products) = match ongoing.host {
+            Some(host) => {
+                self.llvm_backend
+                    .join_codegen(host, sess, incr_comp_session, outputs, crate_info)
+            }
+            None => (
+                CompiledModules {
+                    modules: Vec::new(),
+                    allocator_module: None,
+                },
+                WorkProductMap::default(),
+            ),
+        };
         for (index, object) in ongoing.artifact_objects.into_iter().enumerate() {
             compiled_modules.modules.push(CompiledModule {
                 name: format!("oxide_artifact_embed_{index}"),
