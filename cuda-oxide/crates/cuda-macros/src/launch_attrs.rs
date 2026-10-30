@@ -594,6 +594,25 @@ impl Parse for ClusterArgs {
     }
 }
 
+pub(crate) fn programmatic_launch_entry(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "programmatic_launch takes no arguments: use a bare #[programmatic_launch]",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Launch-time only, like #[cooperative_launch]: the kernel body owns its
+    // `grid::dependency::wait()`.
+    let input = parse_macro_input!(item as ItemFn);
+    quote! {
+        #input
+    }
+    .into()
+}
+
 pub(crate) fn cooperative_launch_entry(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
         return syn::Error::new(

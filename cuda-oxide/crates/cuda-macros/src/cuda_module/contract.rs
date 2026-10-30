@@ -279,6 +279,21 @@ pub(super) fn cuda_module_cluster_dim(
     Ok(None)
 }
 
+pub(super) fn cuda_module_programmatic(attrs: &[syn::Attribute]) -> syn::Result<bool> {
+    for attr in attrs {
+        if attr_path_ends_with(attr, "programmatic_launch") {
+            if !matches!(attr.meta, syn::Meta::Path(_)) {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "programmatic_launch takes no arguments: use a bare #[programmatic_launch]",
+                ));
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn cuda_module_cooperative(attrs: &[syn::Attribute]) -> syn::Result<bool> {
     for attr in attrs {
         if attr_path_ends_with(attr, "cooperative_launch") {

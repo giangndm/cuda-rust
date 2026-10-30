@@ -350,6 +350,44 @@ pub unsafe fn launch_kernel_cooperative_on_stream(
     }
 }
 
+/// Launches a kernel with programmatic dependent launch
+/// (`CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`) on a specific
+/// stream, binding the stream's owning context first: the kernel may start
+/// before the previous kernel in the stream completes, as soon as that kernel
+/// triggers its dependents (or exits).
+///
+/// # Safety
+///
+/// Same preconditions as [`crate::launch_kernel_pdl`]: before any access that
+/// depends on the previous kernel, every thread must execute
+/// `cuda_device::grid::dependency::wait()`.
+///
+/// # Errors
+///
+/// Returns an error if binding `stream.context()` fails or if the underlying
+/// `cuLaunchKernelEx` call rejects the launch.
+#[inline]
+pub unsafe fn launch_kernel_pdl_on_stream(
+    func: &CudaFunction,
+    grid_dim: (u32, u32, u32),
+    block_dim: (u32, u32, u32),
+    shared_mem_bytes: u32,
+    stream: &CudaStream,
+    kernel_params: &mut [*mut std::ffi::c_void],
+) -> Result<(), DriverError> {
+    stream.context().bind_to_thread()?;
+    unsafe {
+        crate::launch_kernel_pdl(
+            func.cu_function(),
+            grid_dim,
+            block_dim,
+            shared_mem_bytes,
+            stream.cu_stream(),
+            kernel_params,
+        )
+    }
+}
+
 /// Low-level wrapper around `cuLaunchKernelEx` with **both** the
 /// `CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION` and
 /// `CU_LAUNCH_ATTRIBUTE_COOPERATIVE` attributes set.

@@ -21,6 +21,7 @@ use crate::cuda_module::constants::{
 };
 use crate::cuda_module::contract::{
     cuda_module_cluster_dim, cuda_module_cooperative, cuda_module_launch_contract,
+    cuda_module_programmatic,
 };
 use crate::cuda_module::launchers::{
     cuda_kernel_marker_name, cuda_module_function_field, generate_cuda_module_async_launch_method,
@@ -626,6 +627,13 @@ fn cuda_module_kernel(
     }
     let cluster_dim = cuda_module_cluster_dim(&item_fn.attrs)?;
     let cooperative = cuda_module_cooperative(&item_fn.attrs)?;
+    let programmatic = cuda_module_programmatic(&item_fn.attrs)?;
+    if programmatic && (cooperative || cluster_dim.is_some()) {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.ident,
+            "#[programmatic_launch] does not combine with #[cooperative_launch] or #[cluster_launch]",
+        ));
+    }
     let params = cuda_module_params(item_fn)?;
     let launch_contract =
         cuda_module_launch_contract(&item_fn.attrs, &item_fn.sig.ident, &params, cluster_dim)?;
@@ -674,6 +682,7 @@ fn cuda_module_kernel(
         params,
         cluster_dim,
         cooperative,
+        programmatic,
         launch_contract,
         is_generic,
     }))

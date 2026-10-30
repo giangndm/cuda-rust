@@ -33,6 +33,8 @@ pub(crate) struct CudaModuleKernel {
     pub(super) params: Vec<CudaModuleParam>,
     pub(super) cluster_dim: Option<(u32, u32, u32)>,
     pub(super) cooperative: bool,
+    /// `#[programmatic_launch]`: launched with programmatic dependent launch.
+    pub(super) programmatic: bool,
     pub(super) launch_contract: Option<CudaModuleLaunchContract>,
     pub(super) is_generic: bool,
 }

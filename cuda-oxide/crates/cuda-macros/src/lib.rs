@@ -796,6 +796,43 @@ pub fn cooperative_launch(attr: TokenStream, item: TokenStream) -> TokenStream {
     launch_attrs::cooperative_launch_entry(attr, item)
 }
 
+/// Marks a kernel for programmatic dependent launch
+/// (`CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION`).
+///
+/// The kernel may start while the previous kernel in its stream is still
+/// running, as soon as that kernel calls
+/// `cuda_device::grid::dependency::trigger_dependents()` (or exits); this
+/// overlaps its launch latency with the predecessor's tail. Like
+/// `#[cooperative_launch]` it changes nothing in the PTX: `#[cuda_module]`
+/// routes the generated launch methods through `cuLaunchKernelEx` with the
+/// attribute set.
+///
+/// # Protocol
+///
+/// Every thread must call `cuda_device::grid::dependency::wait()` before any
+/// access that depends on (or races with) the previous kernel; the wait
+/// returns once that kernel has completed and its writes are visible. Calling
+/// `trigger_dependents()` early lets the next kernel launch early in turn.
+///
+/// ```ignore
+/// #[kernel]
+/// #[programmatic_launch]
+/// pub fn step(mut out: DisjointSlice<f32>) {
+///     unsafe {
+///         grid::dependency::trigger_dependents();
+///         grid::dependency::wait();
+///     }
+///     // ... reads of the previous kernel's output ...
+/// }
+/// ```
+///
+/// Requires sm_90 or newer. Not combinable with `#[cluster_launch]` or
+/// `#[cooperative_launch]`.
+#[proc_macro_attribute]
+pub fn programmatic_launch(attr: TokenStream, item: TokenStream) -> TokenStream {
+    launch_attrs::programmatic_launch_entry(attr, item)
+}
+
 /// Marks a function as a CUDA device function.
 ///
 /// Device functions run on the GPU and can be called from kernels or other device functions,
