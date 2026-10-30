@@ -813,6 +813,8 @@ pub fn cooperative_launch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// access that depends on (or races with) the previous kernel; the wait
 /// returns once that kernel has completed and its writes are visible. Calling
 /// `trigger_dependents()` early lets the next kernel launch early in turn.
+/// The attribute cannot check this: a missing `wait()` silently breaks stream
+/// order.
 ///
 /// ```ignore
 /// #[kernel]
